@@ -451,7 +451,7 @@ def make_color(color):
 def _arr2img(ar):
     """ Convert Numeric array to PIL Image.
     """
-    return Image.fromstring('L', (ar.shape[1], ar.shape[0]), ar.astype(numpy.ubyte).tostring())
+    return Image.frombytes('L', (ar.shape[1], ar.shape[0]), ar.astype(numpy.ubyte).tostring())
 
 def _img2arr(im):
     """ Convert PIL Image to Numeric array.
