@@ -1,4 +1,4 @@
-from transform import to_float
+from util import to_float
 
 # sort functions to apply to features
 
@@ -18,9 +18,16 @@ def _by_feature_property(property_name):
 _by_feature_id = _by_feature_property('id')
 
 
+def _by_area(feature):
+    wkb, properties, fid = feature
+    default_value = -1000
+    sort_key = properties.get('area', default_value)
+    return sort_key
+
+
 def _sort_by_area_then_id(features):
     features.sort(key=_by_feature_id)
-    features.sort(key=_by_feature_property('area'), reverse=True)
+    features.sort(key=_by_area, reverse=True)
     return features
 
 
@@ -41,9 +48,20 @@ def _by_population(feature):
         return default_value
 
 
-def _sort_by_scalerank_then_population(features):
-    features.sort(key=_by_population, reverse=True)
-    features.sort(key=_by_scalerank)
+def _by_transit_routes(feature):
+    wkb, props, fid = feature
+
+    num_lines = 0
+    transit_routes = props.get('transit_routes')
+    if transit_routes is not None:
+        num_lines = len(transit_routes)
+
+    return num_lines
+
+
+def _sort_by_transit_routes_then_feature_id(features):
+    features.sort(key=_by_feature_id)
+    features.sort(key=_by_transit_routes, reverse=True)
     return features
 
 
@@ -59,12 +77,21 @@ def landuse(features, zoom):
     return _sort_by_area_then_id(features)
 
 
+def _place_key_desc(feature):
+    sort_key = _by_population(feature), _by_area(feature)
+    return sort_key
+
+
 def places(features, zoom):
-    return _sort_by_scalerank_then_population(features)
+    features.sort(key=_place_key_desc, reverse=True)
+    features.sort(key=_by_scalerank)
+    features.sort(key=_by_feature_property('mz_n_photos'), reverse=True)
+    features.sort(key=_by_feature_property('min_zoom'))
+    return features
 
 
 def pois(features, zoom):
-    return _sort_features_by_key(features, _by_feature_id)
+    return _sort_by_transit_routes_then_feature_id(features)
 
 
 def roads(features, zoom):

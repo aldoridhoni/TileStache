@@ -6,28 +6,29 @@ from collections import defaultdict
 from shapely.strtree import STRtree
 from shapely.geometry.polygon import orient
 from shapely.ops import linemerge
+from shapely.geometry import Point
+from shapely.geometry import LineString
+from shapely.geometry import LinearRing
+from shapely.geometry import Polygon
+from shapely.geometry.multipoint import MultiPoint
 from shapely.geometry.multilinestring import MultiLineString
 from shapely.geometry.multipolygon import MultiPolygon
 from shapely.geometry.collection import GeometryCollection
+from util import to_float
+from sort import pois as sort_pois
 import re
-
-
-# attempts to convert x to a floating point value,
-# first removing some common punctuation. returns
-# None if conversion failed.
-def to_float(x):
-    if x is None:
-        return None
-    # normalize punctuation
-    x = x.replace(';', '.').replace(',', '.')
-    try:
-        return float(x)
-    except ValueError:
-        return None
 
 
 feet_pattern = re.compile('([+-]?[0-9.]+)\'(?: *([+-]?[0-9.]+)")?')
 number_pattern = re.compile('([+-]?[0-9.]+)')
+
+# used to detect if the "name" of a building is
+# actually a house number.
+digits_pattern = re.compile('^[0-9-]+$')
+
+# used to detect station names which are followed by a
+# parenthetical list of line names.
+station_pattern = re.compile('([^(]*)\(([^)]*)\).*')
 
 
 def _to_float_meters(x):
@@ -122,6 +123,10 @@ road_kind_path = set(('footpath', 'track', 'footway', 'steps', 'pedestrian',
                       'path', 'cycleway'))
 road_kind_rail = set(('rail', 'tram', 'light_rail', 'narrow_gauge',
                       'monorail', 'subway'))
+road_kind_aerialway = set(('gondola', 'cable_car', 'chair_lift', 'drag_lift',
+                           'platter', 't-bar', 'goods', 'magic_carpet',
+                           'rope_tow', 'yes', 'zip_line', 'j-bar', 'unknown',
+                           'mixed_lift', 'canopy', 'cableway'))
 
 
 def _road_kind(properties):
@@ -138,6 +143,9 @@ def _road_kind(properties):
     route = properties.get('route')
     if route == 'ferry':
         return 'ferry'
+    aerialway = properties.get('aerialway')
+    if aerialway in road_kind_aerialway:
+        return 'aerialway'
     return 'minor_road'
 
 
@@ -165,10 +173,11 @@ def building_kind(shape, properties, fid, zoom):
     if kind:
         return shape, properties, fid
     building = _coalesce(properties, 'building:part', 'building')
-    if building and building != 'yes':
-        kind = building
-    else:
-        kind = _coalesce(properties, 'amenity', 'shop', 'tourism')
+    if building:
+        if building != 'yes':
+            kind = building
+        else:
+            kind = 'building'
     if kind:
         properties['kind'] = kind
     return shape, properties, fid
@@ -196,10 +205,17 @@ def building_min_height(shape, properties, fid, zoom):
     return shape, properties, fid
 
 
+def synthesize_volume(shape, props, fid, zoom):
+    area = props.get('area')
+    height = props.get('height')
+    if area is not None and height is not None:
+        props['volume'] = int(area * height)
+    return shape, props, fid
+
+
 def building_trim_properties(shape, properties, fid, zoom):
     properties = _remove_properties(
         properties,
-        'amenity', 'shop', 'tourism',
         'building', 'building:part',
         'building:levels', 'building:min_levels')
     return shape, properties, fid
@@ -243,10 +259,14 @@ def road_sort_key(shape, properties, fid, zoom):
     highway = properties.get('highway', '')
     railway = properties.get('railway', '')
     aeroway = properties.get('aeroway', '')
+    aerialway = properties.get('aerialway', '')
+    service = properties.get('service')
+
+    is_railway = railway in ('rail', 'tram', 'light_rail', 'narrow_guage', 'monorail')
 
     if highway == 'motorway':
         sort_val += 24
-    elif railway in ('rail', 'tram', 'light_rail', 'narrow_guage', 'monorail'):
+    elif is_railway:
         sort_val += 23
     elif highway == 'trunk':
         sort_val += 22
@@ -262,8 +282,28 @@ def road_sort_key(shape, properties, fid, zoom):
         sort_val += 17
     elif highway in ('unclassified', 'service', 'minor'):
         sort_val += 16
+    elif aerialway in ('gondola', 'cable_car'):
+        sort_val += 19
+    elif aerialway in ('chair_lift'):
+        sort_val += 18
+    elif aerialway is not None:
+        sort_val += 16
     else:
         sort_val += 15
+
+    if is_railway and service is not None:
+        if service in ('spur', 'siding'):
+            # make sort val more like residential, unclassified which
+            # also come in at zoom 12
+            sort_val -= 6
+        elif service == 'yard':
+            sort_val -= 7
+        else:
+            sort_val -= 8
+
+    if highway == 'service' and service is not None:
+        # sort alley, driveway, etc... under service
+        sort_val -= 1
 
     if zoom >= 15:
         # Bridges and tunnels add +/- 10
@@ -555,6 +595,116 @@ def _geom_dimensions(g):
 
     return dim
 
+
+def _flatten_geoms(shape):
+    """
+    Flatten a shape so that it is returned as a list
+    of single geometries.
+
+    >>> [g.wkt for g in _flatten_geoms(shapely.wkt.loads('GEOMETRYCOLLECTION (MULTIPOINT(-1 -1, 0 0), GEOMETRYCOLLECTION (POINT(1 1), POINT(2 2), GEOMETRYCOLLECTION (POINT(3 3))), LINESTRING(0 0, 1 1))'))]
+    ['POINT (-1 -1)', 'POINT (0 0)', 'POINT (1 1)', 'POINT (2 2)', 'POINT (3 3)', 'LINESTRING (0 0, 1 1)']
+    >>> _flatten_geoms(Polygon())
+    []
+    >>> _flatten_geoms(MultiPolygon())
+    []
+    """
+    if shape.geom_type.startswith('Multi'):
+        return shape.geoms
+
+    elif shape.is_empty:
+        return []
+
+    elif shape.type == 'GeometryCollection':
+        geoms = []
+
+        for g in shape.geoms:
+            geoms.extend(_flatten_geoms(g))
+
+        return geoms
+
+    else:
+        return [shape]
+
+
+def _filter_geom_types(shape, keep_dim):
+    """
+    Return a geometry which consists of the geometries in
+    the input shape filtered so that only those of the
+    given dimension remain. Collapses any structure (e.g:
+    of geometry collections) down to a single or multi-
+    geometry.
+
+    >>> _filter_geom_types(GeometryCollection(), _POINT_DIMENSION).wkt
+    'GEOMETRYCOLLECTION EMPTY'
+    >>> _filter_geom_types(Point(0,0), _POINT_DIMENSION).wkt
+    'POINT (0 0)'
+    >>> _filter_geom_types(Point(0,0), _LINE_DIMENSION).wkt
+    'GEOMETRYCOLLECTION EMPTY'
+    >>> _filter_geom_types(Point(0,0), _POLYGON_DIMENSION).wkt
+    'GEOMETRYCOLLECTION EMPTY'
+    >>> _filter_geom_types(LineString([(0,0),(1,1)]), _LINE_DIMENSION).wkt
+    'LINESTRING (0 0, 1 1)'
+    >>> _filter_geom_types(Polygon([(0,0),(1,1),(1,0),(0,0)],[]), _POLYGON_DIMENSION).wkt
+    'POLYGON ((0 0, 1 1, 1 0, 0 0))'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (POINT(0 0), LINESTRING(0 0, 1 1))'), _POINT_DIMENSION).wkt
+    'POINT (0 0)'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (POINT(0 0), LINESTRING(0 0, 1 1))'), _LINE_DIMENSION).wkt
+    'LINESTRING (0 0, 1 1)'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (POINT(0 0), LINESTRING(0 0, 1 1))'), _POLYGON_DIMENSION).wkt
+    'GEOMETRYCOLLECTION EMPTY'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (POINT(0 0), GEOMETRYCOLLECTION (POINT(1 1), LINESTRING(0 0, 1 1)))'), _POINT_DIMENSION).wkt
+    'MULTIPOINT (0 0, 1 1)'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (MULTIPOINT(-1 -1, 0 0), GEOMETRYCOLLECTION (POINT(1 1), POINT(2 2), GEOMETRYCOLLECTION (POINT(3 3))), LINESTRING(0 0, 1 1))'), _POINT_DIMENSION).wkt
+    'MULTIPOINT (-1 -1, 0 0, 1 1, 2 2, 3 3)'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (LINESTRING(-1 -1, 0 0), GEOMETRYCOLLECTION (LINESTRING(1 1, 2 2), GEOMETRYCOLLECTION (POINT(3 3))), LINESTRING(0 0, 1 1))'), _LINE_DIMENSION).wkt
+    'MULTILINESTRING ((-1 -1, 0 0), (1 1, 2 2), (0 0, 1 1))'
+    >>> _filter_geom_types(shapely.wkt.loads('GEOMETRYCOLLECTION (POLYGON((-2 -2, -2 2, 2 2, 2 -2, -2 -2)), GEOMETRYCOLLECTION (LINESTRING(1 1, 2 2), GEOMETRYCOLLECTION (POLYGON((3 3, 0 0, 1 0, 3 3)))), LINESTRING(0 0, 1 1))'), _POLYGON_DIMENSION).wkt
+    'MULTIPOLYGON (((-2 -2, -2 2, 2 2, 2 -2, -2 -2)), ((3 3, 0 0, 1 0, 3 3)))'
+    """
+
+    # flatten the geometries, and keep the parts with the
+    # dimension that we want. each item in the parts list
+    # should be a single (non-multi) geometry.
+    parts = []
+    for g in _flatten_geoms(shape):
+        if _geom_dimensions(g) == keep_dim:
+            parts.append(g)
+
+    # figure out how to construct a multi-geometry of the
+    # dimension wanted.
+    if keep_dim == _POINT_DIMENSION:
+        constructor = MultiPoint
+
+    elif keep_dim == _LINE_DIMENSION:
+        constructor = MultiLineString
+
+    elif keep_dim == _POLYGON_DIMENSION:
+        constructor = MultiPolygon
+
+    else:
+        raise ValueError("Unknown dimension %d in _filter_geom_types" % keep_dim)
+
+    if len(parts) == 0:
+        return constructor()
+
+    elif len(parts) == 1:
+        # return the singular geometry
+        return parts[0]
+
+    else:
+        if keep_dim == _POINT_DIMENSION:
+            # not sure why the MultiPoint constructor wants
+            # its coordinates differently from MultiPolygon
+            # and MultiLineString...
+            coords = []
+            for p in parts:
+                coords.extend(p.coords)
+            return MultiPoint(coords)
+
+        else:
+            return constructor(parts)
+
+
 # creates a list of indexes, each one for a different cut
 # attribute value, in priority order.
 #
@@ -637,22 +787,23 @@ class _Cutter:
     # same as the original, or we're not trying to keep the
     # same type.
     def _add(self, shape, props, fid, original_geom_dim):
+        # if keeping the same geometry type, then filter
+        # out anything that's different.
+        if self.keep_geom_type:
+            shape = _filter_geom_types(
+                shape, original_geom_dim)
+
         # don't add empty shapes, they're completely
-        # useless.
+        # useless. the previous step may also have created
+        # an empty geometry if there weren't any items of
+        # the type we're looking for.
         if shape.is_empty:
             return
-
-        # use a custom dimension measurement here, as it
-        # turns out shapely geometry objects don't always
-        # form a hierarchy that's usable with isinstance.
-        shape_dim = _geom_dimensions(shape)
 
         # add the shape as-is unless we're trying to keep
         # the geometry type or the geometry dimension is
         # identical.
-        if not self.keep_geom_type or \
-           shape_dim == original_geom_dim:
-            self.new_features.append((shape, props, fid))
+        self.new_features.append((shape, props, fid))
 
 
     # intersects the shape with the cutting shape and
@@ -664,6 +815,39 @@ class _Cutter:
                    cutting_attr, original_geom_dim):
         inside, outside = \
             self.intersect_func(shape, cutting_shape)
+
+        # intersections are tricky, and it seems that the geos
+        # library (perhaps only certain versions of it) don't
+        # handle intersection of a polygon with its boundary
+        # very well. for example:
+        #
+        # >>> import shapely.geometry as g
+        # >>> p = g.Point(0,0).buffer(1.0, resolution=2)
+        # >>> b = p.boundary
+        # >>> b.intersection(p).wkt
+        # 'MULTILINESTRING ((1 0, 0.7071067811865481 -0.7071067811865469), (0.7071067811865481 -0.7071067811865469, 1.615544574432587e-15 -1), (1.615544574432587e-15 -1, -0.7071067811865459 -0.7071067811865491), (-0.7071067811865459 -0.7071067811865491, -1 -3.231089148865173e-15), (-1 -3.231089148865173e-15, -0.7071067811865505 0.7071067811865446), (-0.7071067811865505 0.7071067811865446, -4.624589118372729e-15 1), (-4.624589118372729e-15 1, 0.7071067811865436 0.7071067811865515), (0.7071067811865436 0.7071067811865515, 1 0))'
+        #
+        # the result multilinestring could be joined back into
+        # the original object. but because it has separate parts,
+        # each requires duplicating the start and end point, and
+        # each separate segment gets a different polygon buffer
+        # in Tangram - basically, it's a problem all round.
+        #
+        # two solutions to this: given that we're cutting, then
+        # the inside and outside should union back to the
+        # original shape - if either is empty then the whole
+        # object ought to be in the other.
+        #
+        # the second solution, for when there is actually some
+        # part cut, is that we can attempt to merge lines back
+        # together.
+        if outside.is_empty and not inside.is_empty:
+            inside = shape
+        elif inside.is_empty and not outside.is_empty:
+            outside = shape
+        elif original_geom_dim == _LINE_DIMENSION:
+            inside = _linemerge(inside)
+            outside = _linemerge(outside)
 
         if cutting_attr is not None:
             inside_props = props.copy()
@@ -992,7 +1176,6 @@ _default_scalerank_for_place_kind = {
     'farm': 13,
 
     'hamlet': 12,
-    'neighbourhood': 12,
 
     'village': 11,
 
@@ -1074,12 +1257,86 @@ def _make_new_properties(props, props_instructions):
 
     return new_props
 
+
+def _snap_to_grid(shape, grid_size):
+    """
+    Snap coordinates of a shape to a multiple of `grid_size`.
+
+    This can be useful when there's some error in point
+    positions, but we're using an algorithm which is very
+    sensitive to coordinate exactness. For example, when
+    calculating the boundary of several items, it makes a
+    big difference whether the shapes touch or there's a
+    very small gap between them.
+
+    This is implemented here because it doesn't exist in
+    GEOS or Shapely. It exists in PostGIS, but only because
+    it's implemented there as well. Seems like it would be a
+    useful thing to have in GEOS, though.
+
+    >>> _snap_to_grid(Point(0.5, 0.5), 1).wkt
+    'POINT (1 1)'
+    >>> _snap_to_grid(Point(0.1, 0.1), 1).wkt
+    'POINT (0 0)'
+    >>> _snap_to_grid(Point(-0.1, -0.1), 1).wkt
+    'POINT (-0 -0)'
+    >>> _snap_to_grid(LineString([(1.1,1.1),(1.9,0.9)]), 1).wkt
+    'LINESTRING (1 1, 2 1)'
+    _snap_to_grid(Polygon([(0.1,0.1),(3.1,0.1),(3.1,3.1),(0.1,3.1),(0.1,0.1)],[[(1.1,0.9),(1.1,1.9),(2.1,1.9),(2.1,0.9),(1.1,0.9)]]), 1).wkt
+    'POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0), (1 1, 1 2, 2 2, 2 1, 1 1))'
+    >>> _snap_to_grid(MultiPoint([Point(0.1, 0.1), Point(0.9, 0.9)]), 1).wkt
+    'MULTIPOINT (0 0, 1 1)'
+    >>> _snap_to_grid(MultiLineString([LineString([(0.1, 0.1), (0.9, 0.9)]), LineString([(0.9, 0.1),(0.1,0.9)])]), 1).wkt
+    'MULTILINESTRING ((0 0, 1 1), (1 0, 0 1))'
+    """
+
+    # snap a single coordinate value
+    def _snap(c):
+        return grid_size * round(c / grid_size, 0)
+
+    # snap all coordinate pairs in something iterable
+    def _snap_coords(c):
+        return [(_snap(x), _snap(y)) for x, y in c]
+
+    # recursively snap all coordinates in an iterable over
+    # geometries.
+    def _snap_multi(geoms):
+        return [_snap_to_grid(g, grid_size) for g in geoms]
+
+    shape_type = shape.geom_type
+    if shape_type == 'Point':
+        return Point(_snap(shape.x), _snap(shape.y))
+
+    elif shape_type == 'LineString':
+        return LineString(_snap_coords(shape.coords))
+
+    elif shape_type == 'Polygon':
+        exterior = LinearRing(_snap_coords(shape.exterior.coords))
+        interiors = []
+        for interior in shape.interiors:
+            interiors.append(LinearRing(_snap_coords(interior.coords)))
+        return Polygon(exterior, interiors)
+
+    elif shape_type == 'MultiPoint':
+        return MultiPoint(_snap_multi(shape.geoms))
+
+    elif shape_type == 'MultiLineString':
+        return MultiLineString(_snap_multi(shape.geoms))
+
+    elif shape_type == 'MultiPolygon':
+        return MultiPolygon(_snap_multi(shape.geoms))
+
+    else:
+        raise ValueError("_snap_to_grid: unimplemented for shape type %s" % repr(shape_type))
+
+
 def exterior_boundaries(feature_layers, zoom,
                         base_layer,
                         new_layer_name=None,
                         prop_transform=None,
                         buffer_size=None,
-                        start_zoom=0):
+                        start_zoom=0,
+                        snap_tolerance=None):
     """
     create new fetures from the boundaries of polygons
     in the base layer, subtracting any sections of the
@@ -1114,13 +1371,7 @@ def exterior_boundaries(feature_layers, zoom,
     # search through all the layers and extract the one
     # which has the name of the base layer we were given
     # as a parameter.
-    for feature_layer in feature_layers:
-        layer_datum = feature_layer['layer_datum']
-        layer_name = layer_datum['name']
-
-        if layer_name == base_layer:
-            layer = feature_layer
-            break
+    layer = _find_layer(feature_layers, base_layer)
 
     # if we failed to find the base layer then it's
     # possible the user just didn't ask for it, so return
@@ -1133,42 +1384,106 @@ def exterior_boundaries(feature_layers, zoom,
 
     features = layer['features']
 
+    # this exists to enable a dirty hack to try and work
+    # around duplicate geometries in the database. this
+    # happens when a multipolygon relation can't
+    # supersede a member way because the way contains tags
+    # which aren't present on the relation. working around
+    # this by calling "union" on geometries proved to be
+    # too expensive (~3x current), so this hack looks at
+    # the way_area of each object, and uses that as a
+    # proxy for identity. it's not perfect, but the chance
+    # that there are two overlapping polygons of exactly
+    # the same size must be pretty small. however, the
+    # STRTree we're using as a spatial index doesn't
+    # directly support setting attributes on the indexed
+    # geometries, so this class exists to carry the area
+    # attribute through the index to the point where we
+    # want to use it.
+    class geom_with_area:
+        def __init__(self, geom, area):
+            self.geom = geom
+            self.area = area
+            self._geom = geom._geom
+
     # create an index so that we can efficiently find the
     # polygons intersecting the 'current' one. Note that
     # we're only interested in intersecting with other
     # polygonal features, and that intersecting with lines
     # can give some unexpected results.
     indexable_features = list()
+    indexable_shapes = list()
     for shape, props, fid in features:
         if shape.geom_type in ('Polygon', 'MultiPolygon'):
-            indexable_features.append(shape)
-    index = STRtree(indexable_features)
+            snapped = shape
+            if snap_tolerance is not None:
+                snapped = _snap_to_grid(shape, snap_tolerance)
+
+                # snapping coordinates might make the shape
+                # invalid, so we need a way to clean them.
+                # one simple, but not foolproof, way is to
+                # buffer them by 0.
+                if not snapped.is_valid:
+                    snapped = snapped.buffer(0)
+
+                # that still might not have done the trick,
+                # so drop any polygons which are still
+                # invalid so as not to cause errors later.
+                if not snapped.is_valid:
+                    # TODO: log this as a warning!
+                    continue
+
+                # skip any geometries that may have become empty
+                if snapped.is_empty:
+                    continue
+
+            indexable_features.append((snapped, props, fid))
+            indexable_shapes.append(geom_with_area(snapped, props.get('area')))
+
+    index = STRtree(indexable_shapes)
 
     new_features = list()
     # loop through all the polygons, taking the boundary
     # of each and subtracting any parts which are within
     # other polygons. what remains (if anything) is the
     # new feature.
-    for feature in features:
+    for feature in indexable_features:
         shape, props, fid = feature
 
-        if shape.geom_type in ('Polygon', 'MultiPolygon'):
-            boundary = shape.boundary
-            cutting_shapes = index.query(boundary)
+        boundary = shape.boundary
+        cutting_shapes = index.query(boundary)
 
-            for cutting_shape in cutting_shapes:
-                if cutting_shape is not shape:
-                    buf = cutting_shape
+        for cutting_item in cutting_shapes:
+            cutting_shape = cutting_item.geom
+            cutting_area = cutting_item.area
 
-                    if buffer_size is not None:
-                        buf = buf.buffer(buffer_size)
+            # dirty hack: this object is probably a
+            # superseded way if the ID is positive and
+            # the area is the same as the cutting area.
+            # using the ID check here prevents the
+            # boundary from being duplicated.
+            is_superseded_way = \
+                cutting_area == props.get('area') and \
+                props.get('id') > 0
 
-                    boundary = boundary.difference(buf)
+            if cutting_shape is not shape and \
+               not is_superseded_way:
+                buf = cutting_shape
 
-            if not boundary.is_empty:
-                new_props = _make_new_properties(props,
-                    prop_transform)
-                new_features.append((boundary, new_props, fid))
+                if buffer_size is not None:
+                    buf = buf.buffer(buffer_size)
+
+                boundary = boundary.difference(buf)
+
+        # filter only linestring-like objects. we don't
+        # want any points which might have been created
+        # by the intersection.
+        boundary = _filter_geom_types(boundary, _LINE_DIMENSION)
+
+        if not boundary.is_empty:
+            new_props = _make_new_properties(props,
+                prop_transform)
+            new_features.append((boundary, new_props, fid))
 
     if new_layer_name is None:
         # no new layer requested, instead add new
@@ -1386,12 +1701,17 @@ def _orient(geom):
 def admin_boundaries(feature_layers, zoom, base_layer,
                      start_zoom=0):
     """
-    Given a layer with admin polygons and maritime boundaries,
-    attempts to output a set of oriented boundaries with properties
-    from both the left and right polygon, and also cut with the
-    maritime information to provide a `maritime_boundary=yes` value
-    where there's overlap between the maritime lines and the
-    polygon boundaries.
+    Given a layer with admin boundaries and inclusion polygons for
+    land-based boundaries, attempts to output a set of oriented
+    boundaries with properties from both the left and right admin
+    boundary, and also cut with the maritime information to provide
+    a `maritime_boundary=yes` value where there's overlap between
+    the maritime lines and the admin boundaries.
+
+    Note that admin boundaries must alread be correctly oriented.
+    In other words, it must have a positive area and run counter-
+    clockwise around the polygon for which it is an outer (or
+    clockwise if it was an inner).
     """
 
     layer = None
@@ -1421,7 +1741,7 @@ def admin_boundaries(feature_layers, zoom, base_layer,
         # the reason to use this rather than compare the
         # string of types is to catch the "multi-" types
         # as well.
-        if dims == _POLYGON_DIMENSION and kind is not None:
+        if dims == _LINE_DIMENSION and kind is not None:
             admin_features[kind].append((shape, props, fid))
 
         elif dims == _POLYGON_DIMENSION and maritime_boundary == 'yes':
@@ -1437,12 +1757,8 @@ def admin_boundaries(feature_layers, zoom, base_layer,
         envelopes = [g[0].envelope for g in features]
 
         for i, feature in enumerate(features):
-            shape, props, fid = feature
+            boundary, props, fid = feature
             envelope = envelopes[i]
-
-            # orient to ensure that the shape is to the
-            # left of the boundary.
-            boundary = _orient(shape).boundary
 
             # intersect with *preceding* features to remove
             # those boundary parts. this ensures that there
@@ -1509,13 +1825,16 @@ def admin_boundaries(feature_layers, zoom, base_layer,
 
 def generate_label_features(
         feature_layers, zoom, source_layer=None, label_property_name=None,
-        label_property_value=None, new_layer_name=None):
+        label_property_value=None, new_layer_name=None, drop_keys=None):
 
     assert source_layer, 'generate_label_features: missing source_layer'
 
     layer = _find_layer(feature_layers, source_layer)
     if layer is None:
         return None
+
+    if drop_keys is None:
+        drop_keys = []
 
     new_features = []
     for feature in layer['features']:
@@ -1541,6 +1860,13 @@ def generate_label_features(
         label_point = shape.representative_point()
 
         label_properties = properties.copy()
+
+        # drop particular keys which might not be relevant any more.
+        # for example, mz_is_building, which is used by a later
+        # polygon processing stage, but irrelevant to label processing.
+        for k in drop_keys:
+            label_properties.pop(k, None)
+
         if label_property_name:
             label_properties[label_property_name] = label_property_value
 
@@ -1562,6 +1888,79 @@ def generate_label_features(
         return label_feature_layer
 
 
+def generate_address_points(
+        feature_layers, zoom, source_layer=None, start_zoom=0):
+    """
+    Generates address points from building polygons where there is an
+    addr:housenumber tag on the building. Removes those tags from the
+    building.
+    """
+
+    assert source_layer, 'generate_address_points: missing source_layer'
+
+    if zoom < start_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    new_features = []
+    for feature in layer['features']:
+        shape, properties, fid = feature
+
+        # We only want to create address points for polygonal
+        # buildings with address tags.
+        if shape.geom_type not in ('Polygon', 'MultiPolygon'):
+            continue
+
+        addr_housenumber = properties.get('addr_housenumber')
+
+        # consider it an address if the name of the building
+        # is just a number.
+        name = properties.get('name')
+        if name is not None and digits_pattern.match(name):
+            if addr_housenumber is None:
+                addr_housenumber = properties.pop('name')
+
+            # and also suppress the name if it's the same as
+            # the address.
+            elif name == addr_housenumber:
+                properties.pop('name')
+
+        # if there's no address, then keep the feature as-is,
+        # no modifications.
+        if addr_housenumber is None:
+            continue
+
+        label_point = shape.representative_point()
+
+        # we're only interested in a very few properties for
+        # address points.
+        label_properties = dict(
+            addr_housenumber=addr_housenumber,
+            kind='address')
+
+        source = properties.get('source')
+        if source is not None:
+            label_properties['source'] = source
+
+        addr_street = properties.get('addr_street')
+        if addr_street is not None:
+            label_properties['addr_street'] = addr_street
+
+        oid = properties.get('id')
+        if oid is not None:
+            label_properties['id'] = oid
+
+        label_feature = label_point, label_properties, fid
+
+        new_features.append(label_feature)
+
+    layer['features'].extend(new_features)
+    return layer
+
+
 def parse_layer_as_float(shape, properties, fid, zoom):
     """
     If the 'layer' property is present on a feature, then
@@ -1577,5 +1976,619 @@ def parse_layer_as_float(shape, properties, fid, zoom):
         layer_float = to_float(layer)
         if layer_float is not None:
             properties['layer'] = layer_float
+
+    return shape, properties, fid
+
+
+def drop_features_where(
+        feature_layers, zoom, source_layer=None, start_zoom=0,
+        property_name=None, drop_property=True,
+        geom_types=None):
+    """
+    Drops some features entirely when they have a property
+    named `property_name` and its value is true. Note that it
+    must be identically True, not just truthy. Also can
+    drop the property if `drop_property` is truthy. If
+    `geom_types` is present and not None, then only types in
+    that list are considered for dropping.
+
+    This is useful for dropping features which we want to use
+    earlier in the pipeline (e.g: to generate points), but
+    that we don't want to appear in the final output.
+    """
+
+    assert source_layer, 'drop_features_where: missing source layer'
+    assert property_name, 'drop_features_where: missing property name'
+
+    if zoom < start_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    new_features = []
+    for feature in layer['features']:
+        shape, properties, fid = feature
+
+        matches_geom_type = \
+            geom_types is None or \
+            shape.geom_type in geom_types
+
+        # figure out what to do with the property - do we
+        # want to drop it, or just fetch it?
+        func = properties.get
+        if drop_property:
+            func = properties.pop
+
+        val = func(property_name, None)
+
+        # skip (i.e: drop) the geometry if the value is
+        # true and it's the geometry type we want.
+        if val == True and matches_geom_type:
+            continue
+
+        # default case is to keep the feature
+        new_features.append((shape, properties, fid))
+
+    layer['features'] = new_features
+    return layer
+
+
+def drop_properties(
+        feature_layers, zoom, source_layer=None, start_zoom=0,
+        properties=None):
+    """
+    Drop all configured properties for features in source_layer
+    """
+
+    assert source_layer, 'drop_properties: missing source layer'
+    assert properties, 'drop_properties: missing properties'
+
+    if zoom < start_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    for feature in layer['features']:
+        shape, f_props, fid = feature
+
+        for prop_to_drop in properties:
+            f_props.pop(prop_to_drop, None)
+
+    return layer
+
+
+def remove_zero_area(shape, properties, fid, zoom):
+    """
+    All features get a numeric area tag, but for points this
+    is zero. The area probably isn't exactly zero, so it's
+    probably less confusing to just remove the tag to show
+    that the value is probably closer to "unspecified".
+    """
+
+    # remove the property if it's present. we _only_ want
+    # to replace it if it matches the positive, float
+    # criteria.
+    area = properties.pop("area", None)
+
+    # try to parse a string if the area has been sent as a
+    # string. it should come through as a float, though,
+    # since postgres treats it as a real.
+    if isinstance(area, (str, unicode)):
+        area = to_float(area)
+
+    if area is not None:
+        # cast to integer to match what we do for polygons.
+        # also the fractional parts of a sq.m are just
+        # noise really.
+        area = int(area)
+        if area > 0:
+            properties['area'] = area
+
+    return shape, properties, fid
+
+
+# circumference of the extent of the world in mercator "meters"
+_MERCATOR_CIRCUMFERENCE = 40075016.68
+
+
+# _Deduplicator handles the logic for deduplication. a feature
+# is considered a duplicate if it has the same property tuple
+# as another and is within a certain distance of the other.
+#
+# the property tuple is calculated by taking a tuple or list
+# of keys and extracting the value of the matching property
+# or None. if none_means_unique is true, then if any tuple
+# entry is None the feature is considered unique and kept.
+#
+# note: distance here is measured in coordinate units; i.e:
+# mercator meters!
+class _Deduplicator:
+    def __init__(self, property_keys, min_distance,
+                 none_means_unique):
+        self.property_keys = property_keys
+        self.min_distance = min_distance
+        self.none_means_unique = none_means_unique
+        self.seen_items = dict()
+
+    def keep_feature(self, feature):
+        """
+        Returns true if the feature isn't a duplicate, and should
+        be kept in the output. Otherwise, returns false, as
+        another feature had the same tuple of values.
+        """
+        shape, props, fid = feature
+
+        key = tuple([props.get(k) for k in self.property_keys])
+        if self.none_means_unique and any([v is None for v in key]):
+            return True
+
+        seen_geoms = self.seen_items.get(key)
+        if seen_geoms is None:
+            # first time we've seen this item, so keep it in
+            # the output.
+            self.seen_items[key] = [shape]
+            return True
+
+        else:
+            # if the distance is greater than the minimum set
+            # for this zoom, then we also keep it.
+            distance = min([shape.distance(s) for s in seen_geoms])
+
+            if distance > self.min_distance:
+                # this feature is far enough away to count as
+                # distinct, but keep this geom to suppress any
+                # other labels nearby.
+                seen_geoms.append(shape)
+                return True
+
+            else:
+                # feature is a duplicate
+                return False
+
+
+def remove_duplicate_features(
+        feature_layers, zoom, source_layer=None, source_layers=None,
+        start_zoom=0, property_keys=None, geometry_types=None,
+        min_distance=0.0, none_means_unique=True):
+    """
+    Removes duplicate features from a layer, or set of layers. The
+    definition of duplicate is anything which has the same values
+    for the tuple of values associated with the property_keys.
+
+    If `none_means_unique` is set, which it is by default, then a
+    value of None for *any* of the values in the tuple causes the
+    feature to be considered unique and completely by-passed. This
+    is mainly to handle things like features missing their name,
+    where we don't want to remove all but one unnamed feature.
+
+    For example, if property_keys was ['name', 'kind'], then only
+    the first feature of those with the same value for the name
+    and kind properties would be kept in the output.
+    """
+
+    # can use either a single source layer, or multiple source
+    # layers, but not both.
+    assert bool(source_layer) ^ bool(source_layers), \
+        'remove_duplicate_features: define either source layer or source layers, but not both'
+
+    # note that the property keys or geometry types could be empty,
+    # but then this post-process filter would do nothing. so we
+    # assume that the user didn't intend this, or they wouldn't have
+    # included the filter in the first place.
+    assert property_keys, 'remove_duplicate_features: missing or empty property keys'
+    assert geometry_types, 'remove_duplicate_features: missing or empty geometry types'
+
+    if zoom < start_zoom:
+        return None
+
+    # allow either a single or multiple layers to be used.
+    if source_layer:
+        source_layers = [source_layer]
+
+    # correct for zoom: min_distance is given in pixels, but we
+    # want to do the comparison in coordinate units to avoid
+    # repeated conversions.
+    min_distance = min_distance * _MERCATOR_CIRCUMFERENCE / float(1 << (zoom + 8))
+
+    # keep a set of the tuple of the property keys. this will tell
+    # us if the feature is unique while allowing us to maintain the
+    # sort order by only dropping later, presumably less important,
+    # features. we keep the geometry of the seen items too, so that
+    # we can tell if any new feature is significantly far enough
+    # away that it should be shown again.
+    deduplicator = _Deduplicator(property_keys, min_distance,
+                                 none_means_unique)
+
+    for source_layer in source_layers:
+        layer_index = -1
+        # because this post-processor can potentially modify
+        # multiple layers, and that wasn't how the return value
+        # system was designed, instead it modifies layers
+        # *in-place*. this is abnormal, and as such requires a
+        # nice big comment like this!
+        for index, feature_layer in enumerate(feature_layers):
+            layer_datum = feature_layer['layer_datum']
+            layer_name = layer_datum['name']
+            if layer_name == source_layer:
+                layer_index = index
+                break
+
+        if layer_index < 0:
+            # TODO: warn about missing layer when we get the
+            # ability to log.
+            continue
+
+        layer = feature_layers[layer_index]
+
+        new_features = []
+        for feature in layer['features']:
+            shape, props, fid = feature
+            keep_feature = True
+
+            if geometry_types is not None and \
+               shape.geom_type in geometry_types:
+                keep_feature = deduplicator.keep_feature(feature)
+
+            if keep_feature:
+                new_features.append(feature)
+
+        # NOTE! modifying the layer *in-place*.
+        layer['features'] = new_features
+        feature_layers[index] = layer
+
+    # returning None here would normally indicate that the
+    # post-processor has done nothing. but because this
+    # modifies the layers *in-place* then all the return
+    # value is superfluous.
+    return None
+
+
+def normalize_and_merge_duplicate_stations(
+        feature_layers, zoom, source_layer=None, start_zoom=0,
+        end_zoom=None):
+    """
+    Normalise station names by removing any parenthetical lines
+    lists at the end (e.g: "Foo St (A, C, E)"). Parse this and
+    use it to replace the `transit_routes` list if that is empty
+    or isn't present.
+
+    Use the name, now appropriately trimmed, to merge station
+    POIs together, unioning their transit routes.
+
+    Stations with empty transit_routes have that property removed.
+
+    Finally, re-sort the features in case the merging has caused
+    the station POIs to be out-of-order.
+    """
+
+    assert source_layer, 'normalize_and_merge_duplicate_stations: missing source layer'
+
+    if zoom < start_zoom:
+        return None
+
+    # we probably don't want to do this at higher zooms (e.g: 17 &
+    # 18), even if there are a bunch of stations very close
+    # together.
+    if end_zoom is not None and zoom > end_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    seen_stations = {}
+    new_features = []
+    for feature in layer['features']:
+        shape, props, fid = feature
+
+        kind = props.get('kind')
+        name = props.get('name')
+        if name is not None and kind == 'station':
+            # this should match station names where the name is
+            # followed by a ()-bracketed list of line names. this
+            # is common in NYC, and we want to normalise by
+            # stripping these off and using it to provide the
+            # list of lines if we haven't already got that info.
+            m = station_pattern.match(name)
+
+            transit_routes = props.get('transit_routes', [])
+
+            if m:
+                # if the lines aren't present or are empty
+                if not transit_routes:
+                    lines = m.group(2).split(',')
+                    transit_routes = [x.strip() for x in lines]
+                    props['transit_routes'] = transit_routes
+
+                # update name so that it doesn't contain all the
+                # lines.
+                name = m.group(1).strip()
+                props['name'] = name
+
+            seen_idx = seen_stations.get(name)
+            if seen_idx is None:
+                seen_stations[name] = len(new_features)
+
+                # ensure that transit routes is present and is of
+                # list type for when we append to it later if we
+                # find a duplicate.
+                props['transit_routes'] = transit_routes
+                new_features.append(feature)
+
+            else:
+                # get the properties and append this duplicate's
+                # transit routes to the list on the original
+                # feature.
+                seen_props = new_features[seen_idx][1]
+
+                # make sure routes are unique
+                unique_transit_routes = set(transit_routes) & \
+                    set(seen_props['transit_routes'])
+                seen_props['transit_routes'] = list(unique_transit_routes)
+
+        else:
+            # not a station, or name is missing - we can't
+            # de-dup these.
+            new_features.append(feature)
+
+    # remove anything that has an empty transit_routes
+    # list, as this most likely indicates that we were
+    # not able to _detect_ what lines it's part of, as
+    # it seems unlikely that a station would be part of
+    # _zero_ routes.
+    for shape, props, fid in new_features:
+        transit_routes = props.pop('transit_routes', [])
+        if transit_routes:
+            props['transit_routes'] = transit_routes
+
+    # might need to re-sort, if we merged any stations:
+    # removing duplicates would have changed the number
+    # of routes for each station.
+    if seen_stations:
+        sort_pois(new_features, zoom)
+
+    layer['features'] = new_features
+    return layer
+
+
+def _match_props(props, items_matching):
+    """
+    Checks if all the items in `items_matching` are also
+    present in `props`. If so, returns true. Otherwise
+    returns false.
+    Each value in `items_matching` can be a list, in which case the
+    value from `props` must be any one of those values.
+    """
+
+    for k, v in items_matching.iteritems():
+        prop_val = props.get(k)
+        if isinstance(v, list):
+            if prop_val not in v:
+                return False
+        elif prop_val != v:
+            return False
+
+    return True
+
+
+def keep_n_features(
+        feature_layers, zoom, source_layer=None, start_zoom=0,
+        end_zoom=None, items_matching=None, max_items=None):
+    """
+    Keep only the first N features matching `items_matching`
+    in the layer. This is primarily useful for removing
+    features which are abundant in some places but scarce in
+    others. Rather than try to set some global threshold which
+    works well nowhere, instead sort appropriately and take a
+    number of features which is appropriate per-tile.
+
+    This is done by counting each feature which matches _all_
+    the key-value pairs in `items_matching` and, when the
+    count is larger than `max_items`, dropping those features.
+    """
+
+    assert source_layer, 'keep_n_features: missing source layer'
+
+    # leaving items_matching or max_items as None (or zero)
+    # would mean that this filter would do nothing, so assume
+    # that this is really a configuration error.
+    assert items_matching, 'keep_n_features: missing or empty item match dict'
+    assert max_items, 'keep_n_features: missing or zero max number of items'
+
+    if zoom < start_zoom:
+        return None
+
+    # we probably don't want to do this at higher zooms (e.g: 17 &
+    # 18), even if there are a bunch of features in the tile, as
+    # we use the high-zoom tiles for overzooming to 20+, and we'd
+    # eventually expect to see _everything_.
+    if end_zoom is not None and zoom > end_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    count = 0
+    new_features = []
+    for shape, props, fid in layer['features']:
+        keep_feature = True
+
+        if _match_props(props, items_matching):
+            count += 1
+            if count > max_items:
+                keep_feature = False
+
+        if keep_feature:
+            new_features.append((shape, props, fid))
+
+    layer['features'] = new_features
+    return layer
+
+
+def rank_features(
+        feature_layers, zoom, source_layer=None, start_zoom=0,
+        items_matching=None, rank_key=None):
+    """
+    Enumerate the features matching `items_matching` and insert
+    the rank as a property with the key `rank_key`. This is
+    useful for the client, so that it can selectively display
+    only the top features, or de-emphasise the later features.
+    """
+
+    assert source_layer, 'rank_features: missing source layer'
+
+    # leaving items_matching or rank_key as None would mean
+    # that this filter would do nothing, so assume that this
+    # is really a configuration error.
+    assert items_matching, 'rank_features: missing or empty item match dict'
+    assert rank_key, 'rank_features: missing or empty rank key'
+
+    if zoom < start_zoom:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    count = 0
+    for shape, props, fid in layer['features']:
+        if _match_props(props, items_matching):
+            count += 1
+            props[rank_key] = count
+
+    return layer
+
+
+def normalize_aerialways(shape, props, fid, zoom):
+    aerialway = props.get('aerialway')
+
+    # normalise cableway, apparently a deprecated
+    # value.
+    if aerialway == 'cableway':
+        props['aerialway'] = 'zip_line'
+
+    # 'yes' is a pretty unhelpful value, so normalise
+    # to a slightly more meaningful 'unknown', which
+    # is also a commonly-used value.
+    if aerialway == 'yes':
+        props['aerialway'] = 'unknown'
+
+    return shape, props, fid
+
+
+def numeric_min_filter(
+        feature_layers, zoom, source_layer=None, filters=None,
+        mode=None):
+    """
+    Keep only features which have properties equal or greater
+    than the configured minima. These are in a dict per zoom
+    like this:
+
+    { 15: { 'area': 1000 }, 16: { 'area': 2000 } }
+
+    This would mean that at zooms 15 and 16, the filter was
+    active. At other zooms it would do nothing.
+
+    Multiple filters can be given for a single zoom. The
+    `mode` parameter can be set to 'any' to require that only
+    one of the filters needs to match, or any other value to
+    use the default 'all', which requires all filters to
+    match.
+    """
+
+    assert source_layer, 'rank_features: missing source layer'
+
+    # assume missing filter is a config error.
+    assert filters, 'numeric_min_filter: missing or empty filters dict'
+
+    # get the minimum filters for this zoom, and return if
+    # there are none to apply.
+    minima = filters.get(zoom)
+    if not minima:
+        return None
+
+    layer = _find_layer(feature_layers, source_layer)
+    if layer is None:
+        return None
+
+    # choose whether all minima have to be met, or just
+    # one of them.
+    aggregate_func = all
+    if mode == 'any':
+        aggregate_func = any
+
+    new_features = []
+    for shape, props, fid in layer['features']:
+        keep = []
+
+        for prop, min_val in minima.iteritems():
+            val = props.get(prop)
+            keep.append(val >= min_val)
+
+        if aggregate_func(keep):
+            new_features.append((shape, props, fid))
+
+    layer['features'] = new_features
+    return layer
+
+
+def copy_features(
+        feature_layers, zoom, source_layer=None, target_layer=None,
+        where=None, geometry_types=None):
+    """
+    Copy features matching _both_ the `where` selection and the
+    `geometry_types` list to another layer. If the target layer
+    doesn't exist, it is created.
+    """
+
+    assert source_layer, 'copy_features: source layer not configured'
+    assert target_layer, 'copy_features: target layer not configured'
+    assert where, 'copy_features: you must specify how to match features in the where parameter'
+    assert geometry_types, 'copy_features: you must specify at least one type of geometry in geometry_types'
+
+    src_layer = _find_layer(feature_layers, source_layer)
+    if src_layer is None:
+        return None
+
+    tgt_layer = _find_layer(feature_layers, target_layer)
+    if tgt_layer is None:
+        # create target layer if it doesn't already exist.
+        tgt_layer_datum = src_layer['layer_datum'].copy()
+        tgt_layer_datum['name'] = target_layer
+        tgt_layer = dict(
+            name=target_layer,
+            features=[],
+            layer_datum=tgt_layer_datum,
+        )
+
+    new_features = []
+    for feature in src_layer['features']:
+        shape, props, fid = feature
+
+        if _match_props(props, where):
+            # need to deep copy, otherwise we could have some
+            # unintended side effects if either layer is
+            # mutated later on.
+            new_features.append((shape.copy(), props.copy(), fid))
+
+    tgt_layer['features'].extend(new_features)
+    return tgt_layer
+
+
+def make_representative_point(shape, properties, fid, zoom):
+    """
+    Replaces the geometry of each feature with its
+    representative point. This is a point which should be
+    within the interior of the geometry, which can be
+    important for labelling concave or doughnut-shaped
+    polygons.
+    """
+
+    shape = shape.representative_point()
 
     return shape, properties, fid
