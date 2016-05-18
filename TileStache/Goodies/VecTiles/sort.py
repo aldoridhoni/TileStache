@@ -41,27 +41,28 @@ def _by_scalerank(feature):
 def _by_population(feature):
     wkb, properties, fid = feature
     default_value = -1000
-    population_flt = to_float(properties.get('population'))
-    if population_flt is not None:
-        return int(population_flt)
-    else:
-        return default_value
+    # depends on a transform run to convert population to an integer
+    population = properties.get('population')
+    return default_value if population is None else population
 
 
-def _by_transit_routes(feature):
+def _by_transit_score(feature):
     wkb, props, fid = feature
-
-    num_lines = 0
-    transit_routes = props.get('transit_routes')
-    if transit_routes is not None:
-        num_lines = len(transit_routes)
-
-    return num_lines
+    return props.get('mz_transit_score', 0)
 
 
-def _sort_by_transit_routes_then_feature_id(features):
+def _by_peak_elevation(feature):
+    wkb, props, fid = feature
+    kind = props.get('kind')
+    if kind != 'peak' and kind != 'volcano':
+        return 0
+    return props.get('elevation', 0)
+
+
+def _sort_by_transit_score_then_elevation_then_feature_id(features):
     features.sort(key=_by_feature_id)
-    features.sort(key=_by_transit_routes, reverse=True)
+    features.sort(key=_by_peak_elevation, reverse=True)
+    features.sort(key=_by_transit_score, reverse=True)
     return features
 
 
@@ -91,7 +92,7 @@ def places(features, zoom):
 
 
 def pois(features, zoom):
-    return _sort_by_transit_routes_then_feature_id(features)
+    return _sort_by_transit_score_then_elevation_then_feature_id(features)
 
 
 def roads(features, zoom):
